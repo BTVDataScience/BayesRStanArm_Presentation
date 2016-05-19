@@ -1,0 +1,154 @@
+---
+title: "Ice cream sales with RStanARM"
+author: "John Stanton-Geddes"
+date: "May 17, 2016"
+output: html_document
+---
+
+This analysis complements my talk for the BTV Data Scientists on May 18, 2016. The slides are available at [http://slides.com/johnstanton-geddes/rstanarm#/](http://slides.com/johnstanton-geddes/rstanarm#/)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+A comparison of Frequentist and Bayesian methods of a simple example of ice cream sales, borrowed from these [blog](http://www.magesblog.com/2015/08/generalised-linear-models-in-r.html) [posts](http://www.magesblog.com/2015/08/visualising-predictive-distribution-of.html).
+
+The data are the units of ice cream sold at different temperatures.
+
+```{r data}
+icecream <- data.frame(
+  temp=c(11.9, 14.2, 15.2, 16.4, 17.2, 18.1, 
+         18.5, 19.4, 22.1, 22.6, 23.4, 25.1),
+  units=c(185L, 215L, 332L, 325L, 408L, 421L, 
+          406L, 412L, 522L, 445L, 544L, 614L)
+  )
+```
+
+
+```{r basic_plot, echo=FALSE}
+basicPlot <- function(...){
+  plot(units ~ temp, data=icecream, bty="n", lwd=2,
+       main="Number of ice creams sold", col="#00526D", 
+       xlab="Temperature (Celsius)", 
+       ylab="Units sold", ...)
+  axis(side = 1, col="grey")
+  axis(side = 2, col="grey")
+}
+basicPlot()
+```
+
+This is first modeled with a simple linear model.
+
+```{r icecream_glm}
+lin_mod <- glm(units ~ temp, data=icecream, 
+              family=gaussian(link="identity"))
+library(arm) # for 'display' function only
+display(lin_mod)
+```
+
+This model returns a negative intercept, which doesn't make sense. To correct this, fit a log-linear model.
+
+```{r icecream_loglin}
+log_lin_mod <- glm(log(units) ~ temp, data=icecream, 
+              family=gaussian(link="identity"))
+arm::display(log_lin_mod)
+```
+
+Nice - the intercept is no longer negative. The predictions from this model are reasonable to 25C, but then increase exponentially. 
+
+```{r, echo = FALSE}
+temp <- 0:35
+p_log_lm <- exp(predict(log_lin_mod, data.frame(temp=0:35), type="response") + 
+                  0.5 * summary(log_lin_mod)$dispersion)
+p.pois <- predict(pois.mod, data.frame(temp=temp), type="response")
+p.bin <- predict(bin.glm, data.frame(temp=temp), type="response")*market.size 
+basicPlot(xlim=range(temp), ylim=c(0,800))
+lines(temp, p_log_lm, type="l", col="red", lwd=2)
+```
+
+### Stan
+
+Next, the blog post shows how to fit this model in a Bayesian framework using Stan.
+
+```{r}
+stanLogTransformed <-"
+data {
+  int N;
+  vector[N] units;
+  vector[N] temp;
+}
+transformed data {  
+  vector[N] log_units;        
+  log_units <- log(units);
+}
+parameters {
+  real alpha;
+  real beta;
+  real tau;
+}
+transformed parameters {
+  real sigma;
+  sigma <- 1.0 / sqrt(tau);
+}
+model{
+  // Model
+  log_units ~ normal(alpha + beta * temp, sigma);
+  // Priors
+  alpha ~ normal(0.0, 1000.0);
+  beta ~ normal(0.0, 1000.0);
+  tau ~ gamma(0.001, 0.001);
+}
+generated quantities{
+  vector[N] units_pred;
+  for(i in 1:N)
+    units_pred[i] <- exp(normal_rng(alpha + beta * temp[i], sigma));
+}
+"
+
+
+temp <- c(11.9,14.2,15.2,16.4,17.2,18.1,18.5,19.4,22.1,22.6,23.4,25.1)
+units <- c(185L,215L,332L,325L,408L,421L,406L,412L,522L,445L,544L,614L)
+library(rstan)
+stanmodel <- stan_model(model_code = stanLogTransformed)
+fit <- sampling(stanmodel,
+                data = list(N=length(units),
+                            units=units,
+                            temp=temp),
+                iter = 1000, warmup=200)
+stanoutput <- extract(fit)
+
+## Extract generated posterior predictive quantities
+Sims <- data.frame(stanoutput[["units_pred"]])
+
+## Calculate summary statistics
+SummarySims <- apply(Sims, 2, summary)
+colnames(SummarySims) <- paste(icecream$temp,"ºC")
+
+## Extract estimated parameters
+(parms <- sapply(stanoutput[c("alpha", "beta", "sigma")], mean))
+
+## Use parameters to predict median and mean
+PredMedian <- exp(parms['alpha'] + parms['beta']*temp)
+PredMean <- exp(parms['alpha'] + parms['beta']*temp + 0.5*parms['sigma']^2)
+
+## Compare predictions based on parameters with simulation statistics
+round(rbind(SummarySims, PredMedian, PredMean),1)
+```
+
+And for comparision, with RStanARM.
+
+```{r, icecream_rstanarm}
+ic_sglm <- stan_glm(log(units) ~ temp, data = icecream, family = gaussian(link = "identity"))
+ic_sglm
+
+ic_cauchy <- stan_glm(log(units) ~ temp, data = icecream, family = gaussian(link = "identity"), 
+                prior = cauchy(), prior_intercept = cauchy())
+ic_cauchy
+
+
+posterior_interval(ic_sglm, prob = 0.95, pars = "temp")
+posterior_interval(ic_cauchy, prob = 0.95, pars = "temp")
+```
+
+Well that was easy! Predictions are the same. 
+
