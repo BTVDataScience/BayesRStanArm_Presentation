@@ -1,0 +1,119 @@
+---
+title: "Workflow A/B Testing"
+author: "John Stanton-Geddes"
+date: "May 18, 2016"
+output: html_document
+---
+
+This analysis complements my talk for the BTV Data Scientists on May 18, 2016. The slides are available at [http://slides.com/johnstanton-geddes/rstanarm#/](http://slides.com/johnstanton-geddes/rstanarm#/)
+
+```{r setup, echo = FALSE, results = 'hide', message = FALSE, warning = FALSE}
+library('rstanarm')
+library('dplyr')
+library('broom')
+library('ggplot2')
+```
+
+Testing the performance of different variants of a website, commonly referred to as A/B testing, is both an extremely common and contentious analysis. In a standard frequentist analysis, a significance criteria of \alpha = 0.05 is used, meaning that the observed result would only be seen 5 times in 100. The problem with this criteria is that often many A/B tests are performed at one time, or sequentially, meaning that *significant* results are more likely to be due to chance than promised; the issue of false positives. This is compounded by the *peaking* problem, where each time you look at the data, you're effectively performing a test and thus increasing the chance of a false positive result and incorrectly early stopping of the test.
+
+Many methods have been suggested to approach this, and a common suggestion is to use Bayesian methods. Many [examples](http://elem.com/~btilly/ab-testing-multiple-looks/part1-rigorous.html) [exist](http://blog.dominodatalab.com/ab-testing-with-hierarchical-models-in-python/) [online](http://blog.dominodatalab.com/ab-testing-with-hierarchical-models-in-python/), and they all more or less promise to reduce the problem of false positives. However, this [post](http://varianceexplained.org/r/bayesian-ab-testing/) fascinated me as it shows that the promise of eliminating the problems of early-stopping and false positives aren't completely true:
+
+> It is often claimed that Bayesian methods, unlike frequentist tests, are immune to this problem, and allow you to peek at your test while it’s running and stop once you’ve collected enough evidence. 
+
+In addition, these approaches also add considerable complexity to the modeling process.
+
+That's why I was excited to hear about the [RStanARM package](http://mc-stan.org/interfaces/rstanarm) for Bayesian Applied Regression Modeling via Stan, which promises to let you use standard R syntax with Bayesian drop-in replacements for common modeling function.
+
+As a test of this package, I decided to explore the false-positive rate for testing the conversion rate on two sets of sites that have different workflow implementations. To do this, I simulate log-normal conversion events from two samples of 50 websites, 'A', and 'B'. This is slightly more complicated than a standard A/B test, which simply asks whether some conversion rate differs between two websites. 
+
+```{r simulate_data}
+sim_dat <- data.frame(
+    version = rep(c("A", "B"), each = 50),
+    conversions = round(rlnorm(n = 100, meanlog = 5, sdlog = .5), 0)
+  )
+  
+ggplot(sim_dat, aes(conversions, fill = version)) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  labs(x = "# of conversions", y = "Count of websites") +
+  scale_fill_manual(values = c("#f26522", "#22aff2")) +
+  theme_bw()
+```
+
+As specified and you can see in the histogram, there's no noticable difference in the distribution of conversions among the two website versions.
+
+Now to test the false positive rate, I simulated 100 repetitions of this data set, randomly drawing from a log-normal distribution for the conversions for both website versions. I then fit a log-normal linear model, `lm(log(conversions ~ version))`, to each simulated data set and extracted the *P*-value. I also fit the `rstanarm` Bayesian replacement `stan_glm(log(conversions) ~ version, family = gaussian()`, and extracted the 95% posterior interval for the version. 
+
+```{r, sim_data, eval = FALSE}
+# store results
+lm_results <- as.numeric()
+
+bayes_pi <- data.frame(prob2.5 = as.numeric(),
+                       prob97.5 = as.numeric())
+
+for(i in 1:10) {
+  # simulate data
+  sim_dat <- data.frame(
+    version = rep(c("A", "B"), each = 50),
+    conversions = round(rlnorm(n = 100, meanlog = 5, sdlog = .5), 0)
+  )
+  
+    # frequentist
+  lm1 <- lm(log(conversions) ~ version, data = sim_dat)
+  lmtidy <- tidy(lm1)
+  pval <- lmtidy[which(lmtidy$term == "versionB"), "p.value"]
+  lm_results <- c(lm_results, pval)
+  
+  # bayesian
+  slm1 <- stan_glm(log(conversions) ~ version, data = sim_dat,
+                   family = gaussian(),
+                   prior = cauchy(), prior_intercept = cauchy())
+  slm1_ci95 <- posterior_interval(slm1, prob = 0.95, pars = "versionB")
+  out <- as.vector(slm1_ci95)
+  bayes_pi <- rbind(bayes_pi, out)
+}
+
+# order lm results
+lm_results <- lm_results[order(lm_results)]
+
+# order Bayes results
+colnames(bayes_pi) <- c("prob2.5", "prob97.5")
+bayes_pi <- bayes_pi %>%
+  arrange(prob2.5)
+```
+
+```{r load_data, eval = TRUE, echo = FALSE}
+# load cached results of running 1000 times
+load("ab_comparison.Rda")
+```
+
+Using the frequentist approah, we would incorrectly say that variant improves the conversion rate in `r length(which(lm_results < 0.05))` of the 100 data simulations. Of course, this is completely expected as the pre-specified significance level is \alpha = 0.05, and thus the method delivers on what it promises.
+
+So how does the Bayesian method compare? Does it prevent false positives?
+
+For each of the 100 simulated data sets, I calculated the 95% credible interval. This table shows the first and last 5, showing that `r length(which(bayes_pi$prob2.5 > 0))` of the credible intervals are greater than zero. This is an improvement over the Frequentist approach, with about half as many false positives!. 
+
+```{r bayes_table}
+bayes_pi$prob2.5 <- as.character(bayes_pi$prob2.5)
+bayes_pi$prob97.5 <- as.character(bayes_pi$prob97.5)
+nt <- data.frame(prob2.5 = "...", prob97.5 = "...", stringsAsFactors = FALSE)
+knitr::kable(bind_rows(head(bayes_pi), nt, tail(bayes_pi)))
+```
+
+Moreover, the Bayesian approach forces the analyst to focus on the credible intervals. You see that even for the 'significant' results, the increase is marginal, with the conclusion that there is no real-world difference between the variants. Of course, looking at the confidence intervals from the Frequentist approach would do the same. 
+
+
+### A note of caution
+
+My first attempt with `rstanarm` gave completely different results, where every simulated dataset had a posterior interval that did not include zero. This was because I used the recommendation to [set the prior based on the location of *R^2*](https://cran.r-project.org/web/packages/rstanarm/vignettes/lm.html#priors). With my 'prior' information that there should be little or no effect, I set the prior *R^2* location to a weak 0.1. 
+
+```{r}
+slm1 <- stan_lm(log(conversions) ~ version, data = sim_dat,
+                prior = R2(what = "mean", location = 0.1))
+slm1
+
+slm1_ci95 <- posterior_interval(slm1, prob = 0.95, pars = "versionB")
+round(exp(slm1_ci95), 2)
+```
+
+For every simulated data set using this approach, the posterior interval for *versionB* was greater than zero, which is clearly not correct. I haven't figure out why this is the case, so...user beware!
+
